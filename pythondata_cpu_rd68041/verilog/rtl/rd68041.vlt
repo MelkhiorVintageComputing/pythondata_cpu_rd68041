@@ -1,0 +1,57 @@
+`verilator_config
+
+// SPDX-License-Identifier: CERN-OHL-S-2.0
+// Copyright 2026 Romain Dolbeau
+// Source location: https://github.com/MelkhiorVintageComputing/RD68041
+
+// Waivers for RD68041. Every one has a reason; see doc/coding-standard.md.
+//
+// Two file-format traps, both measured: the line above must be the first token in
+// this file, and no comment here may start with the word that names this tool --
+// it parses those as directives and reports a syntax error. Globs are matched
+// against the path as given on the command line, so *rtl/foo.sv matches and
+// */rtl/foo.sv does not.
+
+// rd68041_pkg is a catalogue of architectural constants transcribed from the
+// manual. No single module uses all of them, and the point of the package is that
+// the numbers are written down once, in one place, with their citation -- so an
+// unused one is the normal case rather than a defect.
+lint_off -rule UNUSEDPARAM -file "*rtl/rd68041_pkg.sv"
+
+// rst_n is the asynchronous reset of every flip-flop and the synchronous reset of
+// the block RAMs' read registers (rtl/rd68041_bram.sv), which is the only reset a
+// block RAM's output register has. Both uses are deliberate.
+lint_off -rule SYNCASYNCNET -file "*rtl/*" -match "*'rst_n'*"
+
+// The pipeline's helper functions take a whole micro-operation (rd68041_pkg::
+// uop_t) and look at the few fields they need: the struct is the unit the
+// stages pass, and splitting it at every call would hide which stage's
+// micro-operation a check is about.
+lint_off -rule UNUSEDSIGNAL -file "*rtl/rd68041_core.sv" -match "*Bits of signal are not used: 'u'*"
+lint_off -rule UNUSEDSIGNAL -file "*rtl/rd68041_core.sv" -match "*Bits of signal are not used: 'o'*"
+lint_off -rule UNUSEDSIGNAL -file "*rtl/rd68041_core.sv" -match "*Bits of signal are not used: 'x'*"
+lint_off -rule UNUSEDSIGNAL -file "*rtl/rd68041_core.sv" -match "*Bits of signal are not used: 'w'*"
+
+// The decoder's helpers take an extension word and look at the fields their
+// format has (PRM 2.2, Table 2-2); CAS2's words likewise. Unused bits of them
+// are the format's other fields, read by another helper.
+lint_off -rule UNUSEDSIGNAL -file "*rtl/rd68041_decode.sv" -match "*Bits of signal are not used: 'x'*"
+lint_off -rule UNUSEDSIGNAL -file "*rtl/rd68041_decode.sv" -match "*Bits of signal are not used: 'x1'*"
+lint_off -rule UNUSEDSIGNAL -file "*rtl/rd68041_decode.sv" -match "*Bits of signal are not used: 'x2'*"
+
+// PACK keeps bits 11-8 and 3-0 of its sum and drops the others, by definition
+// (PRM 4).
+lint_off -rule UNUSEDSIGNAL -file "*rtl/rd68041_core.sv" -match "*Bits of signal are not used: 't'*"
+
+// rd68041_fpu_pkg is the FPU's catalogue: its internal number's classes, the
+// data path's operations, the FP micro-operations, the formats' converters --
+// written once for the FPU, its data path and their benches, each using some.
+lint_off -rule UNUSEDPARAM -file "*rtl/rd68041_fpu_pkg.sv"
+// The FP helpers take an unpacked number (rd68041_fpu_pkg::fpn_t) and look at
+// the fields their rule needs (a class, a sign; PRM 5's operation tables).
+lint_off -rule UNUSEDSIGNAL -file "*rtl/rd68041_fpu*.sv" -match "*Bits of signal are not used: 'x'*"
+lint_off -rule UNUSEDSIGNAL -file "*rtl/rd68041_fpu*.sv" -match "*Bits of signal are not used: 'y'*"
+lint_off -rule UNUSEDSIGNAL -file "*rtl/rd68041_fpu*.sv" -match "*Bits of signal are not used: 'e'*"
+lint_off -rule UNUSEDSIGNAL -file "*rtl/rd68041_fpu*.sv" -match "*Bits of signal are not used: 'f'*"
+lint_off -rule UNUSEDSIGNAL -file "*rtl/rd68041_fpu*.sv" -match "*Bits of signal are not used: 'c'*"
+lint_off -rule UNUSEDSIGNAL -file "*rtl/rd68041_fpu*.sv" -match "*Bits of signal are not used: 'p'*"
