@@ -45,8 +45,17 @@
 // in the ATC asks the data memory unit for a table search (iw_req), which
 // hands back the entry (iw_fill); then the lookup is done again. An entry not
 // resident, or a user fetch from a supervisor page, puts the words marked in
-// the queue (q_err and q_atc), as a bus error does. PFLUSH and PTEST of a
-// program space flush the ATC from the data memory unit (if_flush).
+// the queue (q_err and q_atc), as a bus error does, and fetching stops there
+// until the next redirect (xstop): the words after the fault can only be
+// wanted after those, whose fault comes first, and fetching on would search
+// the tables for the next page, leaving in the ATC an entry not resident for
+// a page the handler of this fault may well make resident (Linux's fault-
+// around does), which the fetch after its RTE would then fault on again --
+// and Linux, finding that page resident by PTEST, takes that second fault as
+// a protection violation (doc/bugs-found.md).
+//
+// PFLUSH and PTEST of a program space flush the ATC from the data memory unit
+// (if_flush).
 
 module rd68041_ifu (
     input  logic          clk,
@@ -124,6 +133,7 @@ module rd68041_ifu (
   logic [31:0] fa;              // the next word to fetch
   logic        on;              // fetching
   logic        aerr;            // redirected to an odd address: nothing to fetch
+  logic        xstop;           // a fetch faulted in the ATC: nothing more until a redirect
 
   // The window.
   always_comb begin
@@ -321,7 +331,7 @@ module rd68041_ifu (
   wire [1:0] pick = victim(p0_valid, rnd);
 
   // --- the bus ---------------------------------------------------------------------
-  assign want_lk = on && !stop && !aerr && !go && (fs == F_IDLE) && (room >= 4'd4);
+  assign want_lk = on && !stop && !aerr && !xstop && !go && (fs == F_IDLE) && (room >= 4'd4);
   assign f_valid = ((fs == F_FILL) || (fs == F_LONG)) && !busy;
   assign f_addr  = (fs == F_FILL) ? {lp, la[11:2], 2'b00} : {lp, fa[11:2], 2'b00};
   assign f_siz   = (fs == F_FILL) ? rd68041_pkg::SIZ_LINE : rd68041_pkg::SIZ_LONG;
@@ -335,6 +345,7 @@ module rd68041_ifu (
       lcm   <= '0;
       lupa  <= '0;
       aerr  <= 1'b0;
+      xstop <= 1'b0;
       head  <= '0;
       cnt   <= '0;
       hpc   <= '0;
@@ -360,6 +371,7 @@ module rd68041_ifu (
       cnt   <= '0;
       on    <= 1'b0;
       aerr  <= 1'b0;
+      xstop <= 1'b0;
       fs    <= F_IDLE;
       busy  <= 1'b0;
       drop  <= 1'b0;
@@ -378,6 +390,7 @@ module rd68041_ifu (
       if (in_n > 3'd3) begin q[wi[3]] <= in_w[3]; qe[wi[3]] <= in_e; qt[wi[3]] <= in_t; end
       cnt <= cnt_nxt;
       if (in_n != 3'd0) fa <= fa_nxt;
+      if (atc_in) xstop <= 1'b1;
 
       // --- the fetch -----------------------------------------------------------
       case (fs)
@@ -452,6 +465,7 @@ module rd68041_ifu (
         fa   <= go_pc;
         on   <= 1'b1;
         aerr <= go_pc[0];
+        xstop <= 1'b0;
         if (fs == F_LOOK) drop <= 1'b1;
         if (busy && !f_done) drop <= 1'b1;
         if (f_valid && f_ready) drop <= 1'b1;

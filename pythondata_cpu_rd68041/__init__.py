@@ -8,7 +8,7 @@ src = "https://github.com/MelkhiorVintageComputing/RD68041"
 version_str = "0.0"
 version_tuple = (0, 0)
 
-# Data version info: the RD68041 commit the RTL was copied from.
+# Data version info: the RD68041 commit the RTL was copied from, with litex-68k's patches/RD68041 (patches) applied.
 data_git_hash = "0c07e748e6599b6dd7dc93395540edb657ddc496"
 data_git_describe = "0c07e74"
 data_git_msg = """\
@@ -18,6 +18,9 @@ Date:   Sun Oct 25 14:17:54 2026 +0100
 
     M14: NetBSD and Linux on QEMU's virt with the core as its processor
 """
+patches = [
+    "0001-M14-instruction-fetch-stops-at-an-ATC-fault-leaving-.patch",
+]
 
 # The RTL, relative to data_location, in compile order (packages first). The top
 # is rd68041_top; its parameter FPU is 1 for the MC68040, 0 for the MC68LC040.
