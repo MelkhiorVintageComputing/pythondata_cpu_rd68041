@@ -9,14 +9,14 @@ version_str = "0.0"
 version_tuple = (0, 0)
 
 # Data version info: the RD68041 commit the RTL was copied from, as it is.
-data_git_hash = "4d7a9216250b27a626226758d3cb395ccccc4cf9"
-data_git_describe = "4d7a921"
+data_git_hash = "4300689cfc7d382a8137dcd5cdcd20599b302f90"
+data_git_describe = "4300689"
 data_git_msg = """\
-commit 4d7a9216250b27a626226758d3cb395ccccc4cf9
+commit 4300689cfc7d382a8137dcd5cdcd20599b302f90
 Author: Romain Dolbeau <romain@dolbeau.org>
-Date:   Sun Oct 25 19:33:45 2026 +0100
+Date:   Wed Oct 28 08:17:55 2026 +0100
 
-    M14: instruction fetch stops at an ATC fault, leaving the next page alone
+    M14: a fetch fault taken with the instruction part-fetched
 """
 patches = []
 

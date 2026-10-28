@@ -393,19 +393,24 @@ module rd68041_core #(
                        : (q_cnt != 4'd0) && ({1'b0, q_cnt} >= 5'd1 + {1'b0, dec_need});
 
   // An instruction a word of which came from a fetch that faulted is an access
-  // fault (format $7) instead, once its words are all there -- or at once, if
-  // the operation word is one (its `need` means nothing). FA is the faulted
-  // fetch's address; the SSW says a long-word read of program space (UM
-  // 8.4.6.7: "the TM field contains $2 and $6"). A redirect to an odd address
-  // is an address error (format $2, ADDR the address with bit 0 cleared).
+  // fault (format $7) instead, as soon as that word is in the queue -- or at
+  // once, if the operation word is one (its `need` means nothing). Not once
+  // its words are all there: fetching stops at an ATC fault (rd68041_ifu,
+  // xstop), and the words after the faulted ones never come (an instruction
+  // whose extension words are on a page not resident, doc/bugs-found.md).
+  // FA is the faulted fetch's address; the SSW says a long-word read of
+  // program space (UM 8.4.6.7: "the TM field contains $2 and $6"). A redirect
+  // to an odd address is an address error (format $2, ADDR the address with
+  // bit 0 cleared).
   wire [11:0] de_wmask = (12'h1 << (4'd1 + dec_need)) - 12'h1;
+  wire [11:0] de_qmask = (12'h1 << q_cnt) - 12'h1;     // the words there
   wire        de_ferr0 = !step && (q_cnt != 4'd0) && q_err[0];
-  wire        de_ferr  = de_ferr0 || (!step && de_avail && |(q_err & de_wmask));
+  wire        de_ferr  = de_ferr0 || (!step && |(q_err & de_wmask & de_qmask));
   wire        de_aerr  = !step && q_aerr;
   logic [3:0] de_fk;                          // the first faulted word
   always_comb begin
     de_fk = 4'd0;
-    for (int k = 11; k >= 0; k--) if (q_err[k] && de_wmask[k]) de_fk = 4'(k);
+    for (int k = 11; k >= 0; k--) if (q_err[k] && de_wmask[k] && de_qmask[k]) de_fk = 4'(k);
   end
   wire [31:0] de_fa = q_pc + {27'h0, de_fk, 1'b0};
   rd68041_pkg::uop_t de_u;                    // what decode issues
@@ -440,7 +445,7 @@ module rd68041_core #(
   // FSAVE, FRESTORE's second step and a dynamic FMOVEM wait for the pipeline
   // behind decode to empty: the FPU's state, Dn, settled.
   wire  pipe_quiet = !ea_u.valid && !of_u.valid && !ex_u.valid && !w_u.valid;
-  wire  de_issue = running && (de_avail || de_ferr0 || de_aerr) && !de_halted && !ea_stall &&
+  wire  de_issue = running && (de_avail || de_ferr || de_aerr) && !de_halted && !ea_stall &&
                    !(dec_qwait && !pipe_quiet) &&
                    !redirect && (xs == XS_IDLE) && !ser_fly && !x_flush;
   assign q_pop = de_issue && !(de_aerr || de_ferr) ? (step ? dec_pop : 4'd1 + dec_pop) : 4'd0;

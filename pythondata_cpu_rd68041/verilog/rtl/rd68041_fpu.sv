@@ -142,14 +142,25 @@ module rd68041_fpu
   wire [31:0] ln2 = (x_idx[1:0] == 2'd2) ? x_b : s_in[2];
   wire [95:0] mem96 = {ln0, ln1, ln2};
   rd68041_fpu_pkg::fpn_t src_m;                   // a memory or register source, unpacked
+  // Each format unpacked by a continuous assignment, then chosen: with two
+  // processors in one simulation (sim/tb/core_smp_tb), iverilog 12 woke the
+  // two instances' always_comb on the package functions' variables forever
+  // (doc/coding-standard.md, "iverilog 12").
+  rd68041_fpu_pkg::fpn_t src_l, src_s, src_w, src_b, src_d, src_x;
+  assign src_l = rd68041_fpu_pkg::unpack_i(ln0);
+  assign src_s = rd68041_fpu_pkg::unpack_s(ln0);
+  assign src_w = rd68041_fpu_pkg::unpack_i({{16{ln0[15]}}, ln0[15:0]});
+  assign src_b = rd68041_fpu_pkg::unpack_i({{24{ln0[7]}}, ln0[7:0]});
+  assign src_d = rd68041_fpu_pkg::unpack_d({ln0, ln1});
+  assign src_x = rd68041_fpu_pkg::unpack_x({mem96[95:80], mem96[63:0]});   // X (P is unsupported)
   always_comb begin
     case (srcsp)
-      M_L:     src_m = rd68041_fpu_pkg::unpack_i(ln0);
-      M_S:     src_m = rd68041_fpu_pkg::unpack_s(ln0);
-      M_W:     src_m = rd68041_fpu_pkg::unpack_i({{16{ln0[15]}}, ln0[15:0]});
-      M_B:     src_m = rd68041_fpu_pkg::unpack_i({{24{ln0[7]}}, ln0[7:0]});
-      M_D:     src_m = rd68041_fpu_pkg::unpack_d({ln0, ln1});
-      default: src_m = rd68041_fpu_pkg::unpack_x({mem96[95:80], mem96[63:0]});      // X (P is unsupported)
+      M_L:     src_m = src_l;
+      M_S:     src_m = src_s;
+      M_W:     src_m = src_w;
+      M_B:     src_m = src_b;
+      M_D:     src_m = src_d;
+      default: src_m = src_x;
     endcase
   end
   // A resumed operation's operands: ETEMP and FPTEMP, their exponents 16

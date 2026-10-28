@@ -52,7 +52,9 @@
 // a page the handler of this fault may well make resident (Linux's fault-
 // around does), which the fetch after its RTE would then fault on again --
 // and Linux, finding that page resident by PTEST, takes that second fault as
-// a protection violation (doc/bugs-found.md).
+// a protection violation (doc/bugs-found.md). So an instruction may never
+// have all its words in the queue: decode takes the fault as soon as a
+// faulted word it needs is there (rd68041_core).
 //
 // PFLUSH and PTEST of a program space flush the ATC from the data memory unit
 // (if_flush).
