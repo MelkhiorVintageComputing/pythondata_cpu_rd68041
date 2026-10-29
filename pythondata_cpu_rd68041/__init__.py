@@ -9,14 +9,14 @@ version_str = "0.0"
 version_tuple = (0, 0)
 
 # Data version info: the RD68041 commit the RTL was copied from, as it is.
-data_git_hash = "4300689cfc7d382a8137dcd5cdcd20599b302f90"
-data_git_describe = "4300689"
+data_git_hash = "c5ba651cab654a0c6f410bfa071283938a6cfabf"
+data_git_describe = "c5ba651"
 data_git_msg = """\
-commit 4300689cfc7d382a8137dcd5cdcd20599b302f90
+commit c5ba651cab654a0c6f410bfa071283938a6cfabf
 Author: Romain Dolbeau <romain@dolbeau.org>
-Date:   Wed Oct 28 08:17:55 2026 +0100
+Date:   Thu Oct 29 13:09:25 2026 +0100
 
-    M14: a fetch fault taken with the instruction part-fetched
+    M15: one-clock reads, released from <ea> fetch before their answer
 """
 patches = []
 

@@ -203,6 +203,8 @@ module rd68041_core #(
   logic        of_at, of_ma;                  // ... an ATC fault, on the second page
   logic [31:0] ex_md;
   logic        ex_er, ex_av;
+  logic        ex_mw, ex_mok;                 // EX's read was released from OF, answered
+  logic        of_rel_q;                      // ... OF released one last clock
   logic [31:0] w_res;                         // the result
   logic [31:0] w_res2;                        // the second result
   logic [31:0] w_std;                         // the store's data
@@ -585,6 +587,8 @@ module rd68041_core #(
   logic        ld_done, ld_err, st_ready, st_empty, ld_cancel;
   logic [31:0] ld_data;
   logic        ld_valid;
+  logic        ld_take, ld_fast;
+  logic [31:0] ld_fdata;
   logic [31:0] ld_addr;
   logic  [1:0] ld_sz;
   logic [31:0] reset_v;
@@ -632,7 +636,10 @@ module rd68041_core #(
   wire of_mem   = of_u.ld || of_prb;
   wire of_wants = of_u.valid && of_mem && !of_got && running &&
                   (of_prb || (!st_ahead && !xs_hold));
-  assign ld_valid = (rs == R_SSP || rs == R_PC) || of_wants;
+  // A read released to EX before its answer (rd68041_dmu, ld_take) that has
+  // not had it: EX waits, and OF asks for nothing -- one read is outstanding.
+  wire ex_wait  = ex_u.valid && ex_mw && !ex_mok;
+  assign ld_valid = (rs == R_SSP || rs == R_PC) || (of_wants && !ex_wait);
   assign ld_addr  = (rs == R_SSP) ? 32'h0 : (rs == R_PC) ? 32'h4 : of_ea;
   assign ld_sz    = (rs == R_RUN) ? of_u.sz : rd68041_pkg::SZ_L;
 
@@ -643,8 +650,22 @@ module rd68041_core #(
   // Exception processing's reads and the reset's go at once.
   wire of_oldest = (rs != R_RUN) || of_u.xs ||
                    ((!ex_u.valid || ex_u.pc == of_u.pc) && (!w_u.valid || w_u.pc == of_u.pc));
+  // ... and while EX waits for its released read, which the data unit's slot
+  // may hold: nothing older than EX's.
+  wire ld_oldest = ex_wait ? (!w_u.valid || w_u.pc == ex_u.pc) : of_oldest;
 
-  wire of_ready = !of_mem || of_got || ld_done;
+  // The answer is OF's when it is not for the read released last clock or
+  // still pending in EX.
+  wire of_ans   = ld_done && !of_rel_q && !ex_wait;
+  // OF releases a plain read to EX when the data unit takes it this clock
+  // (ld_take, from registers): EX then has its answer from ld_fast/ld_fdata
+  // on the same edge, or waits for ld_done. Not a locked, alternate, MOVE16
+  // or acknowledge read, exception processing's, or an FP operation's (the
+  // FPU starts on its operand in EX).
+  wire of_relk  = of_u.ld && !of_u.lk && !of_u.alt && !of_u.ack && !of_u.m16 && !of_u.xs &&
+                  !of_u.halt && (of_u.fpk == rd68041_fpu_pkg::FK_NONE) && (rs == R_RUN);
+  wire of_rel   = of_relk && of_wants && ld_take && !ex_wait && !of_ans;
+  wire of_ready = !of_mem || of_got || of_ans || of_rel;
   assign of_stall = ex_stall || (of_u.valid && !of_ready);
 
   // A read that ended in a bus error is an access fault (UM 8.2.1), taken when
@@ -657,21 +678,31 @@ module rd68041_core #(
   wire         of_err = of_got ? of_er : ld_err;
   wire         of_atc = of_got ? of_at : ld_atc;
   wire         of_mab = of_got ? of_ma : ld_ma;
-  wire         of_f   = of_u.valid && of_mem && !of_u.ack && of_err;
+  wire         of_f   = of_u.valid && of_mem && !of_u.ack && of_err && !of_rel;
   // An access fault (ATC set) on a read checked as a write -- a probe, a
   // read-modify-write's read -- is a write's (RW 0); a bus error on an
   // unlocked one's read is the read's. A MOVES's space of data or program is
   // TM's data one (UM 3.5.2, Table 3-2).
-  wire         of_rw  = !(of_u.lk || of_prb || (of_atc && of_u.st));
-  wire  [2:0]  of_afc = of_prb ? dfc : sfc;
-  wire  [2:0]  of_fc  = (of_afc[1:0] == 2'b10) ? {of_afc[2], 2'b01} : of_afc;
-  wire  [1:0]  of_siz = (of_u.sz == rd68041_pkg::SZ_B) ? rd68041_pkg::SIZ_BYTE :
-                        (of_u.sz == rd68041_pkg::SZ_W) ? rd68041_pkg::SIZ_WORD : rd68041_pkg::SIZ_LONG;
-  wire [15:0]  of_ssw = {4'h0, of_mab, of_atc, of_u.lk, of_rw, 1'b0, of_siz,
-                         (of_u.alt && (of_fc[1:0] != 2'b01)) ? rd68041_pkg::TT_ALTFC :
-                                                                rd68041_pkg::TT_NORMAL,
-                         of_u.alt ? of_fc : (sup ? rd68041_pkg::TM_SUP_DATA : rd68041_pkg::TM_USER_DATA)};
-  rd68041_pkg::uop_t of_out;                  // the micro-operation as it goes on to EX
+  // An access fault's SSW (UM 8.4.6.2).
+  function automatic logic [15:0] acc_ssw(input rd68041_pkg::uop_t u, input logic prb,
+                                          input logic atc, input logic mab, input logic s,
+                                          input logic [2:0] sfc_, input logic [2:0] dfc_);
+    logic       rw;
+    logic [2:0] afc, fc;
+    logic [1:0] siz;
+    rw  = !(u.lk || prb || (atc && u.st));
+    afc = prb ? dfc_ : sfc_;
+    fc  = (afc[1:0] == 2'b10) ? {afc[2], 2'b01} : afc;
+    siz = (u.sz == rd68041_pkg::SZ_B) ? rd68041_pkg::SIZ_BYTE :
+          (u.sz == rd68041_pkg::SZ_W) ? rd68041_pkg::SIZ_WORD : rd68041_pkg::SIZ_LONG;
+    acc_ssw = {4'h0, mab, atc, u.lk, rw, 1'b0, siz,
+               (u.alt && (fc[1:0] != 2'b01)) ? rd68041_pkg::TT_ALTFC : rd68041_pkg::TT_NORMAL,
+               u.alt ? fc : (s ? rd68041_pkg::TM_SUP_DATA : rd68041_pkg::TM_USER_DATA)};
+  endfunction
+  wire [15:0] of_ssw = acc_ssw(of_u, of_prb, of_atc, of_mab, sup, sfc, dfc);
+  wire [15:0] ex_ssw = acc_ssw(ex_u, 1'b0, ld_atc, ld_ma, sup, sfc, dfc);
+  // The micro-operation as it goes on to EX; EX's released read, faulted.
+  rd68041_pkg::uop_t of_out, ex_flt;
   always_comb begin
     of_out = of_u;
     if (of_f) begin
@@ -680,6 +711,11 @@ module rd68041_core #(
       of_out.imm   = of_ea;
       of_out.tgt   = {16'h0, of_ssw};
     end
+    ex_flt       = ex_u;
+    ex_flt.xvec  = 8'd2;
+    ex_flt.xnext = 1'b0;
+    ex_flt.imm   = ex_ea;
+    ex_flt.tgt   = {16'h0, ex_ssw};
   end
 
   // ===========================================================================
@@ -895,7 +931,7 @@ module rd68041_core #(
   wire ex_fpres = (ex_u.fpk == rd68041_fpu_pkg::FK_OUT) || (ex_u.fpk == rd68041_fpu_pkg::FK_CRR) ||
                   (ex_u.fpk == rd68041_fpu_pkg::FK_RGR) || (ex_u.fpk == rd68041_fpu_pkg::FK_SAVE);
   wire ex_is_div = ex_live && (ex_u.op == rd68041_pkg::OP_DIV);
-  assign div_start = ex_is_div && !div_go && running;
+  assign div_start = ex_is_div && !div_go && running && !ex_wait;
   // div_go: started; div_done: the answer is there (the clock after busy falls).
   wire div_wait = ex_is_div && !(div_go && !div_busy && div_done);
 
@@ -1335,7 +1371,7 @@ module rd68041_core #(
       ex_out.imm = ex_u.ea_en ? ex_ea : 32'h0;
   end
 
-  assign ex_stall    = w_stall || div_wait || fp_wait;
+  assign ex_stall    = w_stall || div_wait || fp_wait || ex_wait;
   assign redirect    = ex_taken && !ex_stall && running && !x_flush;
   assign redirect_pc = ex_target;
 
@@ -1514,7 +1550,8 @@ module rd68041_core #(
       .ld_ack(of_u.ack && rs == R_RUN), .ld_tm(of_u.fn[2:0]), .ld_avec(ld_avec),
       .ld_noalloc(of_u.xs || rs != R_RUN), .ld_m16(of_u.m16 && of_u.ld && rs == R_RUN),
       .ld_wr((of_u.lk || (of_u.ld && of_u.st)) && rs == R_RUN),
-      .ld_probe(of_prb && rs == R_RUN), .ld_oldest(of_oldest), .ld_atc(ld_atc), .ld_ma(ld_ma),
+      .ld_probe(of_prb && rs == R_RUN), .ld_oldest(ld_oldest), .ld_atc(ld_atc), .ld_ma(ld_ma),
+      .ld_take(ld_take), .ld_rel(of_rel && !of_stall), .ld_fast(ld_fast), .ld_fdata(ld_fdata),
       .st_valid(w_st && running && !w_u.halt && !w_drain), .st_addr(w_ea),
       .st_sz(w_u.sz), .st_data(w_std), .st_lock(w_u.lk), .st_locke(w_u.lke),
       .st_alt(w_u.alt), .st_noalloc(w_u.xs), .st_m16(w_u.m16),
@@ -1538,7 +1575,8 @@ module rd68041_core #(
 
   // A redirect, or an exception, kills <ea> fetch: its read, if one is on the
   // bus, is cancelled.
-  assign ld_cancel = (redirect || x_flush) && of_u.valid && of_mem && !of_got;
+  // ... or EX's released one, while it waits.
+  assign ld_cancel = (redirect || x_flush) && ((of_u.valid && of_mem && !of_got) || ex_wait);
 
   assign go    = (rs == R_PC && ld_done) || redirect || x_go;
   assign go_pc = (rs == R_PC) ? ld_data : redirect ? redirect_pc : x_npc;
@@ -1594,6 +1632,7 @@ module rd68041_core #(
       of_ea     <= '0; ex_ea <= '0; w_ea <= '0;
       of_an     <= '0; ex_an <= '0; w_an <= '0;
       of_md     <= '0; of_got <= 1'b0; ex_md <= '0;
+      ex_mw     <= 1'b0; ex_mok <= 1'b0; of_rel_q <= 1'b0;
       of_er     <= 1'b0; of_av <= 1'b0; ex_er <= 1'b0; ex_av <= 1'b0;
       of_at     <= 1'b0; of_ma <= 1'b0;
       w_res     <= '0; w_res2 <= '0; w_std <= '0; w_npc <= '0; w_ccr <= '0;
@@ -1833,7 +1872,16 @@ module rd68041_core #(
       end
 
       // --- <ea> fetch -> execute --------------------------------------------
-      if (of_u.valid && of_mem && !of_got && ld_done) begin
+      // EX's released read answered: as it would have gone on with it.
+      of_rel_q <= 1'b0;
+      if (ex_wait && ld_done) begin
+        ex_md  <= ld_data;
+        ex_er  <= ld_err;
+        ex_av  <= ld_avec;
+        ex_mok <= 1'b1;
+        if (ld_err) ex_u <= ex_flt;
+      end
+      if (of_u.valid && of_mem && !of_got && of_ans) begin
         of_md  <= ld_data;
         of_er  <= ld_err;
         of_at  <= ld_atc;
@@ -1845,9 +1893,12 @@ module rd68041_core #(
         ex_u   <= of_out;
         ex_ea  <= of_ea;
         ex_an  <= of_an;
-        ex_md  <= (of_got) ? of_md : ld_data;
-        ex_er  <= (of_got) ? of_er : ld_err;
-        ex_av  <= (of_got) ? of_av : ld_avec;
+        ex_md  <= of_got ? of_md : of_rel ? ld_fdata : ld_data;
+        ex_er  <= of_got ? of_er : !of_rel && ld_err;
+        ex_av  <= of_got ? of_av : !of_rel && ld_avec;
+        ex_mw  <= of_rel;
+        ex_mok <= ld_fast;
+        of_rel_q <= of_rel && !redirect && !x_flush;
         of_u   <= '0;
         of_got <= 1'b0;
       end

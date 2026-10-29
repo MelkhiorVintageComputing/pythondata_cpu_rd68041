@@ -101,6 +101,15 @@ module rd68041_dmu (
                                        // the pipeline: a serialised or locked read may go
     output logic          ld_atc,      // ld_err was an ATC fault, not a bus error
     output logic          ld_ma,       // ... on the second page of an access that spans two
+    // A read released to EX before its answer (M15): ld_take says, from
+    // registers, that a read asked for this clock is taken this clock --
+    // answered at once (ld_fast, its data ld_fdata, as ld_data will have it),
+    // started, or held in the slot; ld_rel says OF let it go on. Its answer,
+    // if not fast, is the next ld_done.
+    output logic          ld_take,
+    input  logic          ld_rel,
+    output logic          ld_fast,
+    output logic [31:0]   ld_fdata,
 
     // A write, from W.
     input  logic          st_valid,
@@ -277,10 +286,15 @@ module rd68041_dmu (
   // to a supervisor page, a write to a protected one is an access fault. A
   // table search's own accesses, an acknowledge cycle and a MOVES to a space
   // that is not data or program are physical.
-  // The state machine's states (below, "The state machine").
-  typedef enum logic [4:0] { X_IDLE, X_RD, X_LOOK, X_BUS, X_VRD0, X_VRD1, X_VRD2, X_PUSH,
-                             X_VINV, X_FILL, X_CMO, X_M16L, X_M16H0, X_M16H1, X_M16B,
-                             X_M16I, X_M16W, X_WK, X_MMF } x_e;
+  // The state machine's states (below, "The state machine"). Bit 5 is set in
+  // X_IDLE and X_LOOK alone: the translator's input select (t_sel) is that
+  // bit, on the path from the state to st_ready.
+  typedef enum logic [5:0] { X_IDLE = 6'h20, X_LOOK = 6'h21,
+                             X_RD   = 6'h00, X_BUS  = 6'h01, X_VRD0 = 6'h02, X_VRD1 = 6'h03,
+                             X_VRD2 = 6'h04, X_PUSH = 6'h05, X_VINV = 6'h06, X_FILL = 6'h07,
+                             X_CMO  = 6'h08, X_M16L = 6'h09, X_M16H0 = 6'h0A, X_M16H1 = 6'h0B,
+                             X_M16B = 6'h0C, X_M16I = 6'h0D, X_M16W = 6'h0E, X_WK = 6'h0F,
+                             X_MMF  = 6'h10 } x_e;
   x_e          x;
   logic        xld;              // the operation is a read (else a write)
   logic [31:0] xa;               // the next byte's address (logical)
@@ -292,13 +306,19 @@ module rd68041_dmu (
   logic [31:0] xpa0;             // ... and the operation's first byte's
   logic  [1:0] xcm, xupa;        // ... its cache mode and UPA
 
-  wire        t_idle = (x == X_IDLE);
+  // The translator looks at the read asked for in the rest, and in X_LOOK,
+  // which has its piece's translation already (xpa, xcm) -- a state compare
+  // alone, for it is on the path to st_ready (wf_now). A probe, or a read
+  // forwarded from the queue, is answered there too, beside a write
+  // (t_idle), not beside the state machine's own read or a table search's.
+  wire        t_sel  = x[5];
+  wire        t_idle = (x == X_IDLE) || ((x == X_LOOK) && !xld && !xw);
   wire  [2:0] ld_fc  = ld_probe ? dfc : sfc;   // a probe is a write's: DFC
   wire        ld_sv  = ld_alt ? ld_fc[2] : sup;
-  wire [31:0] t_la   = t_idle ? ld_addr : xa;
-  wire        t_s    = t_idle ? ld_sv : xsup;
-  wire        t_wr   = t_idle ? (ld_wr || ld_probe) : (!xld || xwr);
-  wire        t_ph   = t_idle ? (ld_ack || (ld_alt && alt_phys(ld_fc))) : xph;
+  wire [31:0] t_la   = t_sel  ? ld_addr : xa;
+  wire        t_s    = t_sel  ? ld_sv : xsup;
+  wire        t_wr   = t_sel  ? (ld_wr || ld_probe) : (!xld || xwr);
+  wire        t_ph   = t_sel  ? (ld_ack || (ld_alt && alt_phys(ld_fc))) : xph;
 
   logic [1:0] tt_cm, tt_upa;
   logic       tt_wp, tt_hit;
@@ -411,6 +431,12 @@ module rd68041_dmu (
   logic        xbusy;            // a transfer of it is on the bus
   logic        xerr;
   logic        xcancel;          // the read under way was cancelled
+  // A released read (ld_rel): the one last clock (rel_q), one not yet answered
+  // (rel_pend), and the slot holding one that could not start when released.
+  logic        rel_q, rel_pend;
+  logic        sl_v, sl_sv, sl_wr;
+  logic [31:0] sl_a;
+  logic  [1:0] sl_sz;
   logic        xlk, xlke, xalt;  // locked, its last, in SFC's or DFC's space
   logic        xack;             // an acknowledge cycle, with TM xtm
   logic  [2:0] xtm;
@@ -625,7 +651,7 @@ module rd68041_dmu (
   wire        ld_in1 = ({1'b0, ld_addr[2:0]} + {1'b0, ld_n}) <= 4'd8;
   wire        a_ok   = (a_q == ld_addr[9:3]) && !(bw_q && bw_a == a_q);
   wire        ld_cach = de && tr_ok && !tr_cm[1] && !ld_lock && !(ld_alt && alt_phys(ld_fc)) &&
-                        !ld_ack && !ld_m16 && !ld_probe && !ld_wr;
+                        !ld_ack && !ld_m16 && !ld_probe;
   // (A probe has no data: the writes before it need not go first.)
   // (Nor while the queue is frozen by a write that faulted: its writes will
   // not be made, and the instruction the read is for will not complete.)
@@ -640,32 +666,70 @@ module rd68041_dmu (
   // leaves the state machine to the write queue, which those instructions
   // may be waiting on (doc/bugs-found.md M14).
   wire        ld_ser_wait = !ld_probe && !ld_oldest && (ld_lock || (tr_ok && tr_cm[1]));
-  wire        ld_req = ld_valid && !ld_done && !ld_cancel && !ld_ser_wait &&
+  // (A released read's ld_done answers EX, not the read asked for now.)
+  wire        ld_ans = ld_done && !rel_q && !rel_pend;
+  wire        ld_req = ld_valid && !ld_ans && !ld_cancel && !ld_ser_wait &&
                        (ld_probe || wf_pend ||
                         (!(hit0 || hit1 || hit2) && !(tr_cm == 2'b10 && qn != 2'd0)));
   // The fast read: in the state machine's rest, its tags on port 0.
   wire        fast   = (x == X_IDLE) && ld_req && ld_cach && ld_in1 && a_ok && p0_hit;
   // ... and the fast probe: translated in the rest, within one page.
   wire        ld_pg1 = ({1'b0, ld_addr[11:0]} + {10'h0, ld_n}) <= 13'h1000;
-  wire        fastp  = (x == X_IDLE) && ld_req && ld_probe && tr_ok && ld_pg1;
+  wire        fastp  = t_idle && ld_req && ld_probe && tr_ok && ld_pg1;
   wire        fast_a = fast || fastp;
-  assign lk_count = fast || ((x == X_RD) && !xw);
+
+  // The forwarded read: a cachable read whose bytes the youngest queued write
+  // it overlaps holds -- the same logical address in the same space, so the
+  // same byte (a mapping changes only with the queue empty: PFLUSH, and the
+  // MMU's control registers, serialise) -- is answered from the queue, on the
+  // clock after it is asked, as a fast read is. Each in one long word; not a
+  // locked, alternate or MOVE16 write; not while a write that faulted holds
+  // the queue. Otherwise the read waits for the writes (ld_req).
+  wire  [1:0] fk     = (hit2 && qn > 2'd2) ? 2'd2 : hit1 ? 2'd1 : 2'd0;
+  wire [31:0] fq_a   = qa[fk];
+  wire  [2:0] fq_n   = nbytes(qs[fk]);
+  wire  [3:0] fq_end = {2'b00, fq_a[1:0]} + {1'b0, fq_n};
+  wire  [3:0] fl_end = {2'b00, ld_addr[1:0]} + {1'b0, ld_n};
+  wire        fwd    = t_idle && ld_valid && !ld_done && !ld_cancel && !wf_pend && ld_cach &&
+                       (hit0 || hit1 || hit2) && (qf[fk][4:3] == 2'b00) && !qf[fk][1] &&
+                       (fq_a[31:2] == ld_addr[31:2]) && (fq_end <= 4'd4) &&
+                       (ld_addr[1:0] >= fq_a[1:0]) && (fl_end <= fq_end);
+  wire [31:0] fq_lw  = mem_align(qd[fk], qs[fk], fq_a[1:0]);
+  wire [31:0] fq_v   = fq_lw >> (8 * (4 - int'(ld_addr[1:0]) - int'(ld_n)));
+  wire [31:0] fwd_d  = (ld_n == 3'd1) ? {24'h0, fq_v[7:0]} :
+                       (ld_n == 3'd2) ? {16'h0, fq_v[15:0]} : fq_v;
+  assign lk_count = fast || fwd || ((x == X_RD) && !xw);
   wire [63:0] a_hl   = a_rdata[64*p0_way +: 64];
+
+  // The read OF may release: in the rest, nothing the queue holds in its way
+  // (so no forwarding), no read outstanding. It is then fast, or starts, or
+  // -- a serialised or inhibited page's, which waits (ld_req) -- goes into the
+  // slot, which starts it when it may: the read the oldest, the queue empty.
+  assign ld_take  = (x == X_IDLE) && !wf_pend && !lock_open && !(hit0 || hit1 || hit2) &&
+                    !sl_v && !rel_pend;
+  assign ld_fast  = fast;
+  assign ld_fdata = hl_take(a_hl, ld_addr[2:0], ld_n);
+  wire   start_sl = (x == X_IDLE) && sl_v && ld_oldest && (qn == 2'd0) && !wf_pend &&
+                    !lock_open && !cmo_req && !mm_req && !ld_cancel;
 
   // A read starts on the state machine when nothing is under way, nothing it
   // reads is waiting to be written, and it is not the fast one. A locked
   // sequence: its first read waits for the queue to empty, and while it is
   // open nothing unlocked starts (UM 7.4.5: the transfers are indivisible).
-  // MOVE16's read waits for every write: its buffer is free then.
+  // MOVE16's read waits for every write: its buffer is free then. A write
+  // starts beside the fast read or the fast probe: they use the rest's
+  // translation, port 0's tags and port A, a write's start only the queue
+  // head, which its X_RD translates on the next clock.
   wire start_ld = (x == X_IDLE) && ld_req && !fast_a &&
                   ((ld_lock || ld_m16) ? (qn == 2'd0 || wf_pend) : !lock_open) &&
                   !(ld_m16 && lock_open);
-  wire start_st = (x == X_IDLE) && !start_ld && !fast_a && (qn != 2'd0) && !wf_pend &&
+  wire start_st = (x == X_IDLE) && !start_ld && (qn != 2'd0) && !wf_pend &&
                   (!lock_open || qf[0][3]);
-  wire start_c  = (x == X_IDLE) && !ld_req && (qn == 2'd0) && cmo_req;
-  wire start_m  = (x == X_IDLE) && !ld_req && (qn == 2'd0) && !cmo_req && mm_req;
+  wire start_c  = (x == X_IDLE) && !ld_req && !sl_v && (qn == 2'd0) && cmo_req;
+  wire start_m  = (x == X_IDLE) && !ld_req && !sl_v && (qn == 2'd0) && !cmo_req && mm_req;
   // The fetch unit's table search, when nothing else is to start.
-  wire start_iw = (x == X_IDLE) && !start_ld && !fast_a && !start_st && !start_c && !start_m &&
+  wire start_iw = (x == X_IDLE) && !start_ld && !start_sl && !fast_a && !start_st && !start_c &&
+                  !start_m &&
                   !lock_open && iw_req && !iw_done;
 
   // A write that faults this clock (below) freezes the queue: nothing joins it.
@@ -869,6 +933,17 @@ module rd68041_dmu (
                                ((x == X_BUS) && xbusy && d_done && (xn == cur_n) && !d_err) ||
                                ((x == X_M16W) && xbusy && d_done && !d_err));
 
+  // A write that hits, done in X_LOOK, starts the next one there, the queue's
+  // second entry about to be its head, unless a read wants the state machine
+  // (a probe does not: X_LOOK answers it) or a locked sequence is open.
+  wire st_chain = q_out && (x == X_LOOK) && (qn >= 2'd2) && !wf_pend && !lock_open &&
+                  !qf[1][3] && !(ld_valid && !ld_done && !ld_cancel && !ld_probe);
+  // The write that starts: the head, or the one behind it when chained.
+  wire [31:0] qh_a = st_chain ? qa[1] : qa[0];
+  wire  [1:0] qh_s = st_chain ? qs[1] : qs[0];
+  wire [31:0] qh_d = st_chain ? qd[1] : qd[0];
+  wire  [4:0] qh_f = st_chain ? qf[1] : qf[0];
+
   // --- a write that faults (UM 8.2.1: "a bus error on a data write access
   // always results in an access fault exception") -------------------------------
   // Its transfer ends in a bus error; or the line read a copyback write miss
@@ -957,6 +1032,8 @@ module rd68041_dmu (
       sn_way_q <= '0; sn_lw_q <= 1'b0;
       ld_done <= 1'b0;
       ld_data <= '0;
+      rel_q   <= 1'b0; rel_pend <= 1'b0;
+      sl_v    <= 1'b0; sl_sv <= 1'b0; sl_wr <= 1'b0; sl_a <= '0; sl_sz <= '0;
       ld_err  <= 1'b0;
       ld_avec <= 1'b0;
       ld_atc  <= 1'b0;
@@ -979,6 +1056,7 @@ module rd68041_dmu (
       x       <= X_IDLE;
       xbusy   <= 1'b0;
       ld_done <= 1'b0;
+      rel_q   <= 1'b0; rel_pend <= 1'b0; sl_v <= 1'b0;
       lock_open <= 1'b0;
       cmo_on  <= 1'b0;
       cmo_req <= 1'b0;
@@ -1010,6 +1088,21 @@ module rd68041_dmu (
       // ... the one a table search interrupted, too.
       if (ld_cancel && xw && wo == 2'd0 && s_ld) s_can <= 1'b1;
 
+      // --- a released read ----------------------------------------------------------
+      // Fast, it is answered next clock (rel_q); else it is pending until its
+      // ld_done, started now or from the slot. A cancel drops it.
+      rel_q <= ld_rel && !ld_cancel;
+      if (ld_rel && !ld_cancel && !fast) rel_pend <= 1'b1;
+      if (ld_rel && !ld_cancel && !ld_req) begin
+        sl_v  <= 1'b1;
+        sl_a  <= ld_addr;
+        sl_sz <= ld_sz;
+        sl_sv <= ld_sv;
+        sl_wr <= ld_wr;
+      end
+      if (rel_pend && (ld_done || ld_cancel)) rel_pend <= 1'b0;
+      if (start_sl || (sl_v && ld_cancel)) sl_v <= 1'b0;
+
       // --- the fast read -----------------------------------------------------------
       if (fast) begin
         ld_done <= 1'b1;
@@ -1019,6 +1112,14 @@ module rd68041_dmu (
         ld_avec <= 1'b0;
         ld_data <= hl_take(a_hl, ld_addr[2:0], ld_n);
         rnd     <= rnd + 2'd1;
+      end
+      if (fwd) begin
+        ld_done <= 1'b1;
+        ld_err  <= 1'b0;
+        ld_atc  <= 1'b0;
+        ld_ma   <= 1'b0;
+        ld_avec <= 1'b0;
+        ld_data <= fwd_d;
       end
       if (fastp) begin
         ld_done <= 1'b1;
@@ -1063,25 +1164,32 @@ module rd68041_dmu (
             ld_atc <= 1'b0;
             ld_ma  <= 1'b0;
             if (ld_lock) lock_open <= 1'b1;
-          end else if (start_st) begin
-            xld  <= 1'b0;
-            xa   <= qa[0];
-            xa0  <= qa[0];
-            xsup <= qf[0][1] ? dfc[2] : sup;
-            xn   <= nbytes(qs[0]);
-            xd   <= qd[0];
-            xlk  <= qf[0][3];
-            xlke <= qf[0][2];
-            xalt <= qf[0][1] && alt_phys(dfc);
+          end else if (start_sl) begin
+            // The slot's read: a plain one (what OF releases).
+            xld  <= 1'b1;
+            xa   <= sl_a;
+            xa0  <= sl_a;
+            xsup <= sl_sv;
+            xn   <= nbytes(sl_sz);
+            xd   <= '0;
+            xlk  <= 1'b0;
+            xlke <= 1'b0;
+            xalt <= 1'b0;
             xack <= 1'b0;
-            xna  <= qf[0][0];
+            xtm  <= 3'd0;
+            xna  <= 1'b0;
             xerr <= 1'b0;
-            xm16 <= qf[0][4];
+            xcancel <= 1'b0;
+            xm16 <= 1'b0;
             xprb <= 1'b0;
-            xwr  <= 1'b0;
-            xph  <= qf[0][1] && alt_phys(dfc);
+            xwr  <= sl_wr;
+            xph  <= 1'b0;
             xw   <= 1'b0;
             x    <= X_RD;
+            ld_atc <= 1'b0;
+            ld_ma  <= 1'b0;
+          end else if (start_st) begin
+            // (Below, with a write chained in X_LOOK.)
           end else if (start_m) begin
             x <= X_MMF;
           end else if (start_iw) begin
@@ -1497,6 +1605,29 @@ module rd68041_dmu (
 
         default: x <= X_IDLE;
       endcase
+
+      // A write starts: the queue's head, or in X_LOOK the entry behind the
+      // one just done (st_chain).
+      if (start_st || st_chain) begin
+        xld  <= 1'b0;
+        xa   <= qh_a;
+        xa0  <= qh_a;
+        xsup <= qh_f[1] ? dfc[2] : sup;
+        xn   <= nbytes(qh_s);
+        xd   <= qh_d;
+        xlk  <= qh_f[3];
+        xlke <= qh_f[2];
+        xalt <= qh_f[1] && alt_phys(dfc);
+        xack <= 1'b0;
+        xna  <= qh_f[0];
+        xerr <= 1'b0;
+        xm16 <= qh_f[4];
+        xprb <= 1'b0;
+        xwr  <= 1'b0;
+        xph  <= qh_f[1] && alt_phys(dfc);
+        xw   <= 1'b0;
+        x    <= X_RD;
+      end
 
       // A descriptor access is done: the walker takes it.
       if (xw && (x == X_LOOK) && !sn_any && x_cach && p0_hit && xld) begin
