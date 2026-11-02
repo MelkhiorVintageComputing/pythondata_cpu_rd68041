@@ -8,9 +8,16 @@
 // (UM 4): the fetch address, the cache's lookups and fills, the instruction
 // queue, and the decode stage's window on it.
 //
-// The queue is twelve words -- room for the longest instruction, eleven (PRM
-// 2.2: MOVE with two full-format <ea>s). Decode sees all of it and how many
-// words are there, and says how many it took. A redirect -- a taken branch,
+// The queue has sixteen entries and holds up to fifteen words. Decode sees
+// the first twelve -- room for the longest instruction, eleven (PRM 2.2: MOVE
+// with two full-format <ea>s) -- and how many words are there, and says how
+// many it took. What may go in on a clock is worked out from the registers
+// alone, not from what decode takes on it: a lookup starts with room for a
+// half-line (four words), so fetching stops only with at least twelve words
+// held, and decode, which waits for a whole instruction, always gets it. The
+// room left after decode's take would be a clock earlier, but that sum of the
+// issue and the queue's enables was the longest path in the processor
+// (doc/size-and-speed.md); the three spare entries make up for it. A redirect -- a taken branch,
 // from EX, or a fetch restarted behind a serialising instruction -- empties
 // the queue and fetches from the target.
 //
@@ -76,12 +83,12 @@ module rd68041_ifu (
 
     // To decode.
     output logic [191:0]  q_win,       // the queue from its head, word 0 in 191:176
-    output logic  [3:0]   q_cnt,       // how many words are there (0-12)
+    output logic  [3:0]   q_cnt,       // how many words are there (0-15)
     output logic [31:0]   q_pc,        // the head word's address
     output logic [11:0]   q_err,       // which of them came from a faulted fetch (bit k: word k)
     output logic [11:0]   q_atc,       // ... faulted in the ATC (not resident, or supervisor)
     output logic          q_aerr,      // fetching was redirected to an odd address
-    input  logic  [3:0]   q_pop,       // words decode takes this clock (0-12)
+    input  logic  [3:0]   q_pop,       // words decode takes this clock (0-11)
 
     // The bus, through the arbiter.
     output logic          f_valid,
@@ -125,7 +132,8 @@ module rd68041_ifu (
     input  logic          sn_iinv
 );
 
-  localparam int QN = 12;
+  localparam int QN = 16;       // entries, indexed modulo 16; up to QN - 1 words held
+  localparam int QW = 12;       // the words decode sees
 
   logic [15:0] q [0:QN-1];
   logic        qe [0:QN-1];     // ... from a fetch that faulted
@@ -139,9 +147,9 @@ module rd68041_ifu (
 
   // The window.
   always_comb begin
-    for (int k = 0; k < QN; k++) begin
+    for (int k = 0; k < QW; k++) begin
       logic [3:0] i;
-      i = 4'((int'(head) + k) % QN);
+      i = head + 4'(k);
       q_win[191 - 16*k -: 16] = q[i];
       q_err[k] = qe[i];
       q_atc[k] = qt[i];
@@ -272,9 +280,10 @@ module rd68041_ifu (
       .b_addr(b_addr), .b_way(vway), .b_we(b_we), .b_wdata({f_data, f_data}), .b_rdata(b_rdata));
 
   // --- what goes into the queue this clock ---------------------------------------
-  // Up to four words, from a hit's half-line or a response's long word.
+  // Up to four words, from a hit's half-line or a response's long word, as
+  // far as the room the registers say there is.
   wire [63:0] hl     = a_rdata[64*p0_way +: 64];
-  wire  [3:0] room   = 4'(QN) - cnt + q_pop;
+  wire  [3:0] room   = 4'(QN - 1) - cnt;
   // A hit: the half-line's words from la's on.
   wire  [2:0] hit_n  = 3'd4 - {1'b0, la[2:1]};
   wire        hit_in = (fs == F_LOOK) && !drop && cachable_q && p0_hit && ({1'b0, room} >= {2'b00, hit_n});
@@ -288,9 +297,11 @@ module rd68041_ifu (
   wire        err_in = busy && f_done && f_err && !drop && !full &&
                        (fs == F_LONG || (!ferr_beat && fa[31:2] == la[31:2])) &&
                        ({1'b0, room} >= {2'b00, lw_n});
-  // ... or an ATC fault: the words, marked, without a transfer.
-  wire        want_lk;
-  wire        atc_in = want_lk && t_flt;
+  // ... or an ATC fault: the words, marked, without a transfer. Not gated by
+  // a redirect, which empties the queue anyway: go is late (a branch's
+  // condition, from execute) and this is a queue entry's enable.
+  wire        want_lk, want_nr;
+  wire        atc_in = want_nr && t_flt;
   assign lk_count = want_lk && !t_ph;
 
   logic [2:0]  in_n;
@@ -316,14 +327,20 @@ module rd68041_ifu (
   end
 
   // Computed here, not as variables inside the clocked process: yosys keeps
-  // such a variable as a register (doc/coding-standard.md).
-  wire [3:0] tail    = 4'((int'(head) + int'(cnt)) % QN);
-  // Where the k-th word goes, unsigned: a size cast of an int is signed in
-  // iverilog, and index 8 as a signed four bits is -8.
+  // such a variable as a register (doc/coding-standard.md). The indices wrap
+  // at sixteen by themselves.
+  wire [3:0] tail    = head + cnt;
   logic [3:0] wi [0:3];
-  always_comb for (int k = 0; k < 4; k++) wi[k] = 4'((int'(tail) + k) % QN);
+  always_comb for (int k = 0; k < 4; k++) wi[k] = tail + 4'(k);
   wire [3:0] cnt_nxt = cnt - q_pop + {1'b0, in_n};
   wire [31:0] fa_nxt = fa + {28'h0, in_n, 1'b0};
+  // The head's address after decode's take: q_pop is late (the issue), so
+  // only the low five bits are added after it, the carry choosing between
+  // the rest and the rest plus one, both from registers. Eleven words at
+  // most: one carry.
+  wire  [5:0] hpc_lo  = {1'b0, hpc[4:0]} + {1'b0, q_pop, 1'b0};
+  wire [31:5] hpc_hi1 = hpc[31:5] + 27'd1;
+  wire [31:0] hpc_nxt = {hpc_lo[5] ? hpc_hi1 : hpc[31:5], hpc_lo[4:0]};
 
   // The way a fill takes: the first invalid, else the counter's.
   function automatic logic [1:0] victim(input logic [3:0] v, input logic [1:0] r);
@@ -333,7 +350,8 @@ module rd68041_ifu (
   wire [1:0] pick = victim(p0_valid, rnd);
 
   // --- the bus ---------------------------------------------------------------------
-  assign want_lk = on && !stop && !aerr && !xstop && !go && (fs == F_IDLE) && (room >= 4'd4);
+  assign want_nr = on && !stop && !aerr && !xstop && (fs == F_IDLE) && (room >= 4'd4);
+  assign want_lk = want_nr && !go;
   assign f_valid = ((fs == F_FILL) || (fs == F_LONG)) && !busy;
   assign f_addr  = (fs == F_FILL) ? {lp, la[11:2], 2'b00} : {lp, fa[11:2], 2'b00};
   assign f_siz   = (fs == F_FILL) ? rd68041_pkg::SIZ_LINE : rd68041_pkg::SIZ_LONG;
@@ -381,8 +399,8 @@ module rd68041_ifu (
     end else begin
       // --- the queue ---------------------------------------------------------
       if (q_pop != 4'd0) begin
-        head <= 4'((int'(head) + int'(q_pop)) % QN);
-        hpc  <= hpc + {27'h0, q_pop, 1'b0};
+        head <= head + q_pop;
+        hpc  <= hpc_nxt;
       end
       // Written out: a loop variable in this process would be a register to
       // yosys (doc/coding-standard.md).
@@ -468,7 +486,10 @@ module rd68041_ifu (
         on   <= 1'b1;
         aerr <= go_pc[0];
         xstop <= 1'b0;
-        if (fs == F_LOOK) drop <= 1'b1;
+        // A lookup ends this clock; only a miss, going on to fill, has
+        // words still to come. A hit's are not queued (cnt and fa above),
+        // and a drop left set would cost the next lookup, the target's.
+        if (fs == F_LOOK && !drop && !p0_hit) drop <= 1'b1;
         if (busy && !f_done) drop <= 1'b1;
         if (f_valid && f_ready) drop <= 1'b1;
         // A long word not yet asked for is not wanted.

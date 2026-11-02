@@ -732,9 +732,13 @@ module rd68041_dmu (
                   !start_m &&
                   !lock_open && iw_req && !iw_done;
 
-  // A write that faults this clock (below) freezes the queue: nothing joins it.
+  // A write that faults (below) freezes the queue from the next clock: one
+  // that joins it on the clock the fault is found is frozen with the others,
+  // in the frame (wf_cap), as if it had come a clock sooner. Not waiting for
+  // the fault keeps the data ATC's lookup off st_ready and the core's stall
+  // (M15, the frequency review's F4).
   logic  wf_now;
-  assign st_ready = st_valid && (qn != 2'd3) && !wf_pend && !wf_now;
+  assign st_ready = st_valid && (qn != 2'd3) && !wf_pend;
 
   // --- port 0: the fast read's tags in the rest, else the piece's or CMO's line --
   // Indexed by the logical address's bits 9-4, which are the physical one's;
@@ -962,15 +966,23 @@ module rd68041_dmu (
   wire [6:0] wa0   = wr_attr(qs[0], qf[0][4], qf[0][1], dfc, sup);
   wire [6:0] wa1   = wr_attr(qs[1], qf[1][4], qf[1][1], dfc, sup);
   wire [6:0] wa2   = wr_attr(qs[2], qf[2][4], qf[2][1], dfc, sup);
+  wire [6:0] wan   = wr_attr(st_sz, st_m16, st_alt, dfc, sup);
+  // The write joining the queue on the fault's clock is WB2 or WB3 (above).
+  wire        wf_n1 = st_ready && (qn == 2'd1);
+  wire        wf_n2 = st_ready && (qn == 2'd2);
   wire [15:0] wf_ssw  = {4'h0, wf_ma, wf_atc, qf[0][3], 1'b0, 1'b0, wa0};
-  wire [15:0] wf_wb3s = (qn > 2'd2) ? {8'h00, 1'b1, wa2} : 16'h0000;
-  wire [15:0] wf_wb2s = (qn > 2'd1) ? {8'h00, 1'b1, wa1} : 16'h0000;
+  wire [15:0] wf_wb3s = (qn > 2'd2) ? {8'h00, 1'b1, wa2} :
+                        wf_n2       ? {8'h00, 1'b1, wan} : 16'h0000;
+  wire [15:0] wf_wb2s = (qn > 2'd1) ? {8'h00, 1'b1, wa1} :
+                        wf_n1       ? {8'h00, 1'b1, wan} : 16'h0000;
   wire [15:0] wf_wb1s = qf[0][4] ? 16'h0000 : {8'h00, 1'b1, wa0};
   wire [31:0] wf_wb1a = qf[0][4] ? {xpa[31:4], 4'h0} : wf_atc ? qa[0] : xpa0;
   wire [127:0] wf_pd  = qf[0][4] ? mb : {96'h0, mem_align(qd[0], qs[0], qa[0][1:0])};
   wire [383:0] wf_cap = {wf_pd[127:96], wf_pd[95:64], wf_pd[63:32], wf_pd[31:0], wf_wb1a,
-                         (qn > 2'd1) ? qd[1] : 32'h0, (qn > 2'd1) ? qa[1] : 32'h0,
-                         (qn > 2'd2) ? qd[2] : 32'h0, (qn > 2'd2) ? qa[2] : 32'h0,
+                         (qn > 2'd1) ? qd[1] : wf_n1 ? st_data : 32'h0,
+                         (qn > 2'd1) ? qa[1] : wf_n1 ? st_addr : 32'h0,
+                         (qn > 2'd2) ? qd[2] : wf_n2 ? st_data : 32'h0,
+                         (qn > 2'd2) ? qa[2] : wf_n2 ? st_addr : 32'h0,
                          qa[0], wf_wb2s, wf_wb1s, wf_ssw, wf_wb3s};
   wire [1:0] q_in = qn - {1'b0, q_out};
   wire [4:0] st_f = {st_m16, st_lock, st_locke, st_alt, st_noalloc};
@@ -1662,6 +1674,13 @@ module rd68041_dmu (
         if (sn_wbe[1]) pb[32*int'(sn_addr[3:2]) +  8 +: 8] <= sn_wdata[15:8];
         if (sn_wbe[0]) pb[32*int'(sn_addr[3:2])      +: 8] <= sn_wdata[7:0];
       end
+      // ... and the long word it sank is dirty: the push writes it. Its dirty
+      // bits were taken when the line was chosen, and a push of one dirty
+      // long word is a long-word transfer (one_dirty), which would leave the
+      // sunk one out, lost (doc/bugs-found.md M15).
+      if (sn_wr && sn_on_v && (sn_wbe != 4'h0) &&
+          (x == X_VRD0 || x == X_VRD1 || x == X_VRD2 || x == X_PUSH))
+        vdirty[sn_addr[3:2]] <= 1'b1;
 
       // The oldest write is done: the queue moves up; and a new write joins
       // the queue behind those still there. Each entry is assigned once a

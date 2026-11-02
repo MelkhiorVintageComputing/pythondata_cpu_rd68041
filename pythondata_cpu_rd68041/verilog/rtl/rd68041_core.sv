@@ -260,7 +260,14 @@ module rd68041_core #(
   // instruction's micro-operations before its last write is saved here the
   // first time, and XS_UNDO writes the saved values back when the instruction
   // takes an exception before completing.
-  logic [31:0] ush [0:15];
+  // LUT RAM (M15, the area review's A3): a bank per register-file write port
+  // whose old value is logged (ub0-ub2), and which bank holds each register
+  // (ubk). A bank entry is read only while its umask bit is set, so after it
+  // was written: nothing the RAM powered up holding is seen.
+  logic [31:0] ub0 [0:15];
+  logic [31:0] ub1 [0:15];
+  logic [31:0] ub2 [0:15];
+  logic  [1:0] ubk [0:15];
   logic [15:0] umask;
   logic        ic_op, ic_busy;                // CINV, CPUSH of the instruction cache
   logic        dc_op, dc_busy;                // ... and of the data cache
@@ -340,16 +347,21 @@ module rd68041_core #(
   // FMOVEM's list (PRM 5): the command word's low byte, or Dn's, read once the
   // pipeline behind decode is empty (de_dyn); reversed, so that the lowest
   // set bit is the first register both ways: FP0 first for the control modes
-  // and (An)+, FP7 first for -(An) -- the decoder takes mv_reg[2:0].
+  // and (An)+, FP7 first for -(An) -- the decoder takes mv_reg[2:0]. Dn's is
+  // registered (dyn_l) and the instruction issues on the clock after, not
+  // the register file's read into the decoder and so into the queue's pop on
+  // the one clock: that was the longest path (doc/size-and-speed.md).
   wire  [15:0] cmd_w  = q_win[175:160];
   wire         de_fmm = (FPU != 0) && !step && (q_win[191:182] == 10'b1111_0010_00) &&
                         (cmd_w[15:14] == 2'b11);
   wire         de_dyn = de_fmm && cmd_w[11];
+  logic  [7:0] dyn_l;                         // Dn's list, reversed, read last clock
+  logic        dyn_ok;                        // ... with the pipeline empty, this instruction at the head
   function automatic logic [7:0] rev8(input logic [7:0] v);
     rev8 = {v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]};
   endfunction
   assign mv_src = step   ? mv_mask :
-                  de_dyn ? {8'h0, rev8(qa[7:0])} :
+                  de_dyn ? {8'h0, dyn_l} :
                   de_fmm ? {8'h0, rev8(cmd_w[7:0])} : q_win[175:160];
   always_comb begin
     mv_bit = 16'h0;
@@ -448,7 +460,7 @@ module rd68041_core #(
   // behind decode to empty: the FPU's state, Dn, settled.
   wire  pipe_quiet = !ea_u.valid && !of_u.valid && !ex_u.valid && !w_u.valid;
   wire  de_issue = running && (de_avail || de_ferr || de_aerr) && !de_halted && !ea_stall &&
-                   !(dec_qwait && !pipe_quiet) &&
+                   !(dec_qwait && !pipe_quiet) && !(de_dyn && !dyn_ok && !(de_ferr || de_aerr)) &&
                    !redirect && (xs == XS_IDLE) && !ser_fly && !x_flush;
   assign q_pop = de_issue && !(de_aerr || de_ferr) ? (step ? dec_pop : 4'd1 + dec_pop) : 4'd0;
 
@@ -808,12 +820,17 @@ module rd68041_core #(
   // C holds the parameters OP_BFPRM made -- width in 18-13, offset 12-8 -- and
   // for memory the last byte in 7-0; B the register or the first access, as
   // EA sized them (bf_bytes). bf_win is the five bytes from the field's first,
-  // those it does not cover zero.
+  // those it does not cover zero. The parameters are taken from bf_prm, the
+  // copy OP_BFPRM leaves as it goes on to write-back, not from C: C comes
+  // through the forwarding from W, and the forwarding, the rotate and the
+  // condition codes were one of the longest paths (doc/size-and-speed.md).
+  // OP_BF follows its own instruction's OP_BFPRM, in order, every time.
+  logic [18:8] bf_prm;
   logic [31:0] bf_field, bf_sx, bf_ins, bf_mreg;
   logic [39:0] bf_mmem, bf_win;
   logic [31:0] bf_m1, bf_m2;                      // the merged bytes, as written back
   always_comb begin
-    case (bf_bytes(c_v[10:8], c_v[18:13]))
+    case (bf_bytes(bf_prm[10:8], bf_prm[18:13]))
       3'd1:    bf_win = {bv[7:0], 32'h0};
       3'd2:    bf_win = {bv[15:0], 24'h0};
       3'd3:    bf_win = {bv[15:0], c_v[7:0], 16'h0};
@@ -822,7 +839,7 @@ module rd68041_core #(
     endcase
   end
   always_comb begin
-    case (bf_bytes(c_v[10:8], c_v[18:13]))
+    case (bf_bytes(bf_prm[10:8], bf_prm[18:13]))
       3'd1:    begin bf_m1 = {24'h0, bf_mmem[39:32]}; bf_m2 = 32'h0;                   end
       3'd2:    begin bf_m1 = {16'h0, bf_mmem[39:24]}; bf_m2 = 32'h0;                   end
       3'd3:    begin bf_m1 = {16'h0, bf_mmem[39:24]}; bf_m2 = {24'h0, bf_mmem[23:16]}; end
@@ -834,7 +851,6 @@ module rd68041_core #(
   logic  [5:0] bf_ffo;
   always_comb begin
     case (ex_u.fn[2:0])
-      3'd2:    bf_ins = ~bf_field;                     // BFCHG
       3'd4:    bf_ins = 32'h0;                         // BFCLR
       3'd6:    bf_ins = 32'hFFFF_FFFF;                 // BFSET
       default: bf_ins = av;                            // BFINS
@@ -842,24 +858,29 @@ module rd68041_core #(
   end
   rd68041_bitfield u_bf (
       .is_reg(ex_u.fn[3]), .reg_data(bv), .mem_data(bf_win),
-      .roff(c_v[12:8]), .boff(c_v[10:8]), .width(c_v[18:13]), .ins(bf_ins),
+      .roff(bf_prm[12:8]), .boff(bf_prm[10:8]), .width(bf_prm[18:13]), .ins(bf_ins),
+      .flip(ex_u.fn[2:0] == 3'd2),                     // BFCHG
       .field(bf_field), .sxfield(bf_sx), .msb(bf_msb), .zero(bf_zero), .ffo(bf_ffo),
       .merged_reg(bf_mreg), .merged_mem(bf_mmem));
 
   // --- the multiplier (fn: {64-bit, long, signed}) ------------------------------
   // 32 x 32 to 64, signed or not, the word forms on sign- or zero-extended
-  // halves (PRM 4, MULS and MULU).
-  logic [63:0] prod;
+  // halves (PRM 4, MULS and MULU). One signed 33 x 33 multiply: the
+  // operands' 33rd bit is their sign, or 0 unsigned, and the product's low 64
+  // bits are the answer either way -- a quarter of the DSPs of 64 x 64.
+  logic        [63:0] prod;
+  logic signed [32:0] mul_a, mul_b;
+  logic signed [65:0] mul_p;
   always_comb begin
-    logic [63:0] pa, pb;
     if (ex_u.fn[1]) begin
-      pa = ex_u.fn[0] ? {{32{av[31]}}, av} : {32'h0, av};
-      pb = ex_u.fn[0] ? {{32{bv[31]}}, bv} : {32'h0, bv};
+      mul_a = {ex_u.fn[0] && av[31], av};
+      mul_b = {ex_u.fn[0] && bv[31], bv};
     end else begin
-      pa = ex_u.fn[0] ? {{48{av[15]}}, av[15:0]} : {48'h0, av[15:0]};
-      pb = ex_u.fn[0] ? {{48{bv[15]}}, bv[15:0]} : {48'h0, bv[15:0]};
+      mul_a = ex_u.fn[0] ? {{17{av[15]}}, av[15:0]} : {17'h0, av[15:0]};
+      mul_b = ex_u.fn[0] ? {{17{bv[15]}}, bv[15:0]} : {17'h0, bv[15:0]};
     end
-    prod = pa * pb;
+    mul_p = mul_a * mul_b;
+    prod = mul_p[63:0];
   end
 
   // --- the divider (fn: {64-bit dividend, long, signed}) --------------------------
@@ -890,6 +911,7 @@ module rd68041_core #(
   logic        fp_wait, fp_ct, fp_xn, fp_xc, fp_commit;
   logic [31:0] fp_res, fp_xea;
   logic  [7:0] fp_xv;
+  logic        fp_cx;
   logic  [3:0] fp_xf;
   wire         ex_fp   = ex_live && (ex_u.fpk != rd68041_fpu_pkg::FK_NONE) && running;
   // The micro-operation's <ea> is a memory one: it accesses it, or it is the
@@ -906,7 +928,7 @@ module rd68041_core #(
         // The frame's address field: the operand's first byte (each micro-op
         // moves the long word fidx of it).
         .x_ea(ex_ea - {25'h0, ex_u.fidx, 2'b00}), .x_eam(fp_eam),
-        .x_wait(fp_wait), .x_res(fp_res), .x_ct(fp_ct), .x_xv(fp_xv), .x_xn(fp_xn),
+        .x_wait(fp_wait), .x_res(fp_res), .x_ct(fp_ct), .x_xv(fp_xv), .x_cx(fp_cx), .x_xn(fp_xn),
         .x_xf(fp_xf), .x_xea(fp_xea), .x_xc(fp_xc),
         .w_commit(fp_commit), .flush(x_flush),
         .sv_n(fp_svn), .rs_n(fp_rsn));
@@ -915,6 +937,7 @@ module rd68041_core #(
     assign fp_res  = 32'h0;
     assign fp_ct   = 1'b0;
     assign fp_xv   = 8'd0;
+    assign fp_cx   = 1'b0;
     assign fp_xn   = 1'b0;
     assign fp_xf   = 4'h0;
     assign fp_xea  = 32'h0;
@@ -1204,8 +1227,8 @@ module rd68041_core #(
       rd68041_pkg::OP_BF: begin
         if (ex_u.fn[2:0] == 3'd7) begin
           logic [31:0] lm;
-          lm = (c_v[18:13] == 6'd32) ? 32'hFFFF_FFFF : ((32'h1 << c_v[18:13]) - 32'h1);
-          ccr_n = {ccr_x[4], av[c_v[17:13] - 5'd1], (av & lm) == 32'h0, 1'b0, 1'b0};
+          lm = (bf_prm[18:13] == 6'd32) ? 32'hFFFF_FFFF : ((32'h1 << bf_prm[18:13]) - 32'h1);
+          ccr_n = {ccr_x[4], av[bf_prm[17:13] - 5'd1], (av & lm) == 32'h0, 1'b0, 1'b0};
         end else begin
           ccr_n = {ccr_x[4], bf_msb, bf_zero, 1'b0, 1'b0};
         end
@@ -1312,8 +1335,11 @@ module rd68041_core #(
 
   // DBcc branches unless the condition holds or the counter has run out.
   wire dbcc_take = (ex_u.op == rd68041_pkg::OP_DBCC) && !ex_ct && (bv[15:0] != 16'h0000);
-  // (An FP micro-operation that takes an exception here does not branch.)
-  wire ex_brc   = ex_live && !ex_u.halt && (ex_u.br != rd68041_pkg::BR_NONE) && (fp_xv == 8'd0) &&
+  // (An FP micro-operation that takes an exception here does not branch. The
+  // FP micro-operations that branch are FK_COND's, FBcc and FDBcc, whose
+  // exceptions -- a pending one, BSUN -- the FPU says apart (fp_cx): fp_xv
+  // has every kind's operand checks behind it.)
+  wire ex_brc   = ex_live && !ex_u.halt && (ex_u.br != rd68041_pkg::BR_NONE) && !fp_cx &&
                   ((ex_u.op == rd68041_pkg::OP_DBCC) ? dbcc_take :
                    ((ex_u.br != rd68041_pkg::BR_DISP) || ex_ct));
   wire [31:0] ex_target = (ex_u.br == rd68041_pkg::BR_DISP) ? ex_u.tgt :
@@ -1507,10 +1533,11 @@ module rd68041_core #(
     for (int r = 15; r >= 0; r--) if (umask[r]) xu_r = 4'(r);
   end
   wire xu_we = (xs == XS_UNDO) && (umask != 16'h0);
+  wire [31:0] xu_v = (ubk[xu_r] == 2'd2) ? ub2[xu_r] : (ubk[xu_r] == 2'd1) ? ub1[xu_r] : ub0[xu_r];
 
   assign we0 = (w_wr && w_u.wr) || (rs == R_SSP && ld_done) || xr_we || xu_we;
   assign wa0 = xu_we ? {1'b0, xu_r} : (rs == R_SSP || xr_we) ? 5'd15 : w_u.wr_reg;
-  assign wd0 = xu_we ? ush[xu_r] : (rs == R_SSP) ? ld_data : xr_we ? xr_v : w_res;
+  assign wd0 = xu_we ? xu_v : (rs == R_SSP) ? ld_data : xr_we ? xr_v : w_res;
   assign wm0 = (rs == R_SSP || xr_we || xu_we) ? 4'hF : lanes_of(w_u.wr_sz);
 
   // What the log takes this clock: the old value of each architectural
@@ -1590,6 +1617,24 @@ module rd68041_core #(
   assign retire_pc  = x_go ? x_ipc : w_u.pc;
   assign retire_npc = x_go ? x_npc : w_npc;
 
+  // The bit field's parameters, as OP_BFPRM goes from execute to write-back.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) bf_prm <= '0;
+    else if (!ex_stall && ex_u.valid && ex_u.op == rd68041_pkg::OP_BFPRM) bf_prm <= res[18:8];
+  end
+
+  // A dynamic FMOVEM's list, from Dn as it is once nothing behind decode can
+  // change it; held good until the instruction issues or fetching restarts.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      dyn_l  <= '0;
+      dyn_ok <= 1'b0;
+    end else begin
+      dyn_l  <= rev8(qa[7:0]);
+      dyn_ok <= de_dyn && !ea_u.valid && pipe_quiet && !de_issue && !go && !x_flush;
+    end
+  end
+
   // ===========================================================================
   // The pipeline's registers
   // ===========================================================================
@@ -1615,7 +1660,7 @@ module rd68041_core #(
       x_srn     <= '0; x_npc <= '0; x_ipc <= '0; x_rerun <= 1'b0;
       xs_int    <= 1'b0;
       rst_cnt   <= '0;
-      for (int r = 0; r < 16; r++) ush[r] <= '0;
+      for (int r = 0; r < 16; r++) ubk[r] <= 2'd0;
       umask     <= '0;
       seq       <= 5'd0;
       de_ind    <= 2'b00;
@@ -1714,9 +1759,9 @@ module rd68041_core #(
       if (!w_stall) w_u <= '0;
 
       // --- the undo log ---------------------------------------------------------
-      if (u_log0 && !umask[wa0[3:0]]) begin ush[wa0[3:0]] <= rf_o0; umask[wa0[3:0]] <= 1'b1; end
-      if (u_log1 && !umask[wa1[3:0]]) begin ush[wa1[3:0]] <= rf_o1; umask[wa1[3:0]] <= 1'b1; end
-      if (u_log2 && !umask[wa2[3:0]]) begin ush[wa2[3:0]] <= rf_o2; umask[wa2[3:0]] <= 1'b1; end
+      if (u_log0 && !umask[wa0[3:0]]) begin ubk[wa0[3:0]] <= 2'd0; umask[wa0[3:0]] <= 1'b1; end
+      if (u_log1 && !umask[wa1[3:0]]) begin ubk[wa1[3:0]] <= 2'd1; umask[wa1[3:0]] <= 1'b1; end
+      if (u_log2 && !umask[wa2[3:0]]) begin ubk[wa2[3:0]] <= 2'd2; umask[wa2[3:0]] <= 1'b1; end
       if (w_go && w_u.last) umask <= '0;
       if (xu_we) umask[xu_r] <= 1'b0;
       if (xs == XS_UNDO && umask == 16'h0) xs <= XS_SR;
@@ -1968,7 +2013,14 @@ module rd68041_core #(
     end
   end
 
+  // The undo log's banks (above): no reset, written only.
+  always_ff @(posedge clk) begin
+    if (u_log0 && !umask[wa0[3:0]]) ub0[wa0[3:0]] <= rf_o0;
+    if (u_log1 && !umask[wa1[3:0]]) ub1[wa1[3:0]] <= rf_o1;
+    if (u_log2 && !umask[wa2[3:0]]) ub2[wa2[3:0]] <= rf_o2;
+  end
+
   logic unused_ok;
-  assign unused_ok = &{1'b0, reset_v, cmd_w[13:12], cmd_w[10:8]};
+  assign unused_ok = &{1'b0, reset_v, cmd_w[13:12], cmd_w[10:8], mul_p[65:64]};
 
 endmodule

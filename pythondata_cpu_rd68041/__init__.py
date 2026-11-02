@@ -9,14 +9,14 @@ version_str = "0.0"
 version_tuple = (0, 0)
 
 # Data version info: the RD68041 commit the RTL was copied from, as it is.
-data_git_hash = "c5ba651cab654a0c6f410bfa071283938a6cfabf"
-data_git_describe = "c5ba651"
+data_git_hash = "2ceb016b3d76129c3199d403d3dc8ffacdd7cfdc"
+data_git_describe = "2ceb016"
 data_git_msg = """\
-commit c5ba651cab654a0c6f410bfa071283938a6cfabf
+commit 2ceb016b3d76129c3199d403d3dc8ffacdd7cfdc
 Author: Romain Dolbeau <romain@dolbeau.org>
-Date:   Thu Oct 29 13:09:25 2026 +0100
+Date:   Mon Nov 2 09:22:38 2026 +0100
 
-    M15: one-clock reads, released from <ea> fetch before their answer
+    M15: the Quadra runs take no host input
 """
 patches = []
 

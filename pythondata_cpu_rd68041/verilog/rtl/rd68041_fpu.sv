@@ -42,6 +42,7 @@ module rd68041_fpu
     output logic [31:0]  x_res,
     output logic         x_ct,       // FK_COND: the predicate holds
     output logic  [7:0]  x_xv,       // an exception this micro-operation takes, 0 none
+    output logic         x_cx,       // ... FK_COND's: x_xv != 0 for one, from registers
     output logic         x_xn,       // ... after it (else before)
     output logic  [3:0]  x_xf,       // ... its frame's format
     output logic [31:0]  x_xea,      // ... the frame's address field
@@ -60,7 +61,13 @@ module rd68041_fpu
   // State
   // ===========================================================================
   localparam logic [79:0] NAN_X = {1'b0, 15'h7FFF, 64'hFFFF_FFFF_FFFF_FFFF};
-  logic [79:0] fpr [0:7];
+  // FP7-FP0 in LUT RAM (M15, the area review's A4), written by a record's
+  // commit, with a valid bit each: one clear reads a NaN, which is what a reset,
+  // RSTI and FRESTORE of a null frame leave them (UM 9.2), and covers whatever
+  // the RAM powered up holding (CLAUDE.md). Read at three addresses: the source,
+  // the destination and FMOVEM's register.
+  logic [79:0] fpm [0:7];
+  logic  [7:0] fv;
   logic [15:0] fpcr;             // ENABLE 15-8, MODE 7-4 (UM 9.2.2)
   logic [31:0] fpsr;             // CC 27-24, QUOTIENT 23-16, EXC 15-8, AEXC 7-3
   logic [31:0] fpiar;
@@ -101,6 +108,9 @@ module rd68041_fpu
   wire [2:0] opcl  = cmdw[15:13];
   wire [2:0] srcsp = cmdw[12:10];          // a register, or a memory format
   wire [2:0] dstr  = cmdw[9:7];
+  wire [79:0] fpr_s = fv[srcsp] ? fpm[srcsp] : NAN_X;
+  wire [79:0] fpr_d = fv[dstr]  ? fpm[dstr]  : NAN_X;
+  wire [79:0] fpr_x = fv[x_reg] ? fpm[x_reg] : NAN_X;
   wire [6:0] opm   = cmdw[6:0];
   // Memory formats: 0 L, 1 S, 2 X, 3 P, 4 W, 5 D, 6 B, 7 P (dynamic k).
   localparam logic [2:0] M_L = 3'd0, M_S = 3'd1, M_X = 3'd2, M_P = 3'd3, M_W = 3'd4,
@@ -174,9 +184,9 @@ module rd68041_fpu
   wire fp_src  = (opcl == 3'b000);
   rd68041_fpu_pkg::fpn_t srcn, dstn;
   assign srcn = rsm ? unpack_t(fr[22][31:16], fr[15][28], {fr[23], fr[24]}) :
-                fp_src ? rd68041_fpu_pkg::unpack_x(fpr[srcsp]) : src_m;
+                fp_src ? rd68041_fpu_pkg::unpack_x(fpr_s) : src_m;
   assign dstn = (rsm && !mono) ? unpack_t(fr[19][31:16], fr[17][28], {fr[20], fr[21]})
-                               : rd68041_fpu_pkg::unpack_x(fpr[dstr]);
+                               : rd68041_fpu_pkg::unpack_x(fpr_d);
   wire  pk_src = !rsm && !fp_src && (srcsp == M_P || srcsp == M_PK);
 
   function automatic logic [2:0] tag_of(input rd68041_fpu_pkg::fpn_t x);
@@ -249,7 +259,7 @@ module rd68041_fpu
   wire  op_uns   = !rsm && op_gen && impl && !is_mvcr && (pk_src || src_dn || dst_dn);
   wire  [2:0] ofmt = srcsp;                                // FMOVE out's format
   rd68041_fpu_pkg::fpn_t outn;
-  assign outn = rd68041_fpu_pkg::unpack_x(fpr[dstr]);                       // FMOVE out's source: FPm in 9-7
+  assign outn = rd68041_fpu_pkg::unpack_x(fpr_d);                       // FMOVE out's source: FPm in 9-7
   wire  out_uns  = !rsm && op_out && ((outn.cls == rd68041_fpu_pkg::C_DNRMX) || ofmt == M_P || ofmt == M_PK);
   // FMOVE.X out does not round; nor do FTST and FCMP.
   wire  out_x    = op_out && (ofmt == M_X);
@@ -425,14 +435,18 @@ module rd68041_fpu
                        ((fmt0[31:24] == 8'h41) &&
                         (fmt0[23:16] == 8'h00 || fmt0[23:16] == 8'h30 || fmt0[23:16] == 8'h60));
 
+  // A condition's exception, the two x_xv takes for FK_COND: what a branch
+  // needs, without the operand checks of the rest (rd68041_core, ex_brc).
+  assign x_cx = x_v && (takep || (bsun && en[7]));
+
   always_comb begin
     x_res = 32'h0; x_ct = 1'b0;
     x_xv = 8'd0; x_xn = 1'b0; x_xf = 4'h0; x_xea = 32'h0; x_xc = 1'b0;
     case (x_k)
       rd68041_fpu_pkg::FK_OUT:  x_res = s_out[x_idx[1:0]];
       rd68041_fpu_pkg::FK_CRR:  x_res = (x_idx[1:0] == 2'd2) ? {16'h0, fpcr} : (x_idx[1:0] == 2'd1) ? fpsr : fpiar;
-      rd68041_fpu_pkg::FK_RGR:  x_res = (x_idx[1:0] == 2'd0) ? {fpr[x_reg][79:64], 16'h0} :
-                       (x_idx[1:0] == 2'd1) ? fpr[x_reg][63:32] : fpr[x_reg][31:0];
+      rd68041_fpu_pkg::FK_RGR:  x_res = (x_idx[1:0] == 2'd0) ? {fpr_x[79:64], 16'h0} :
+                       (x_idx[1:0] == 2'd1) ? fpr_x[63:32] : fpr_x[31:0];
       rd68041_fpu_pkg::FK_SAVE: x_res = sv_long(st, x_idx, fr[fr_k]);
       rd68041_fpu_pkg::FK_COND: x_ct  = pred(x_cmd[4:0], fcc);
       default: ;
@@ -495,7 +509,7 @@ module rd68041_fpu
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      for (int i = 0; i < 8; i++) fpr[i] <= NAN_X;
+      fv <= 8'h00;
       for (int i = 0; i <= 24; i++) fr[i] <= '0;
       for (int i = 0; i < 3; i++) begin s_in[i] <= '0; s_out[i] <= '0; end
       fpcr <= '0; fpsr <= '0; fpiar <= '0; st <= rd68041_fpu_pkg::ST_NULL; pend <= 1'b0;
@@ -507,8 +521,7 @@ module rd68041_fpu
     end else if (crst) begin
       // RSTI resets the FPU (UM 9.2: "a reset ... sets FP7-FP0 to NANs").
       // (Written out: a loop variable here would be a register to yosys.)
-      fpr[0] <= NAN_X; fpr[1] <= NAN_X; fpr[2] <= NAN_X; fpr[3] <= NAN_X;
-      fpr[4] <= NAN_X; fpr[5] <= NAN_X; fpr[6] <= NAN_X; fpr[7] <= NAN_X;
+      fv <= 8'h00;
       fpcr <= '0; fpsr <= '0; fpiar <= '0; st <= rd68041_fpu_pkg::ST_NULL; pend <= 1'b0;
       ph <= 2'd0; rec_v <= 1'b0;
     end else begin
@@ -516,7 +529,7 @@ module rd68041_fpu
       // (Only its own micro-operation's: another FP one may leave W while the
       // record's is still in EX.)
       if (w_commit && rec_v && rec_w) begin
-        if (rc_fpr_we)   fpr[rc_fpr_n] <= rc_fpr_v;
+        if (rc_fpr_we)   fv[rc_fpr_n] <= 1'b1;
         if (rc_fpsr_we)  fpsr <= rc_fpsr_v;
         if (rc_fpcr_we)  fpcr <= rc_fpcr_v;
         if (rc_fpiar_we) fpiar <= rc_fpiar_v;
@@ -527,8 +540,7 @@ module rd68041_fpu
         else if (rc_null && (st == rd68041_fpu_pkg::ST_NULL || rc_idle)) begin st <= rd68041_fpu_pkg::ST_IDLE; pend <= 1'b0; end
         rec_v <= 1'b0;
         if (rc_st_we && rc_st_v == rd68041_fpu_pkg::ST_NULL) begin
-          fpr[0] <= NAN_X; fpr[1] <= NAN_X; fpr[2] <= NAN_X; fpr[3] <= NAN_X;
-          fpr[4] <= NAN_X; fpr[5] <= NAN_X; fpr[6] <= NAN_X; fpr[7] <= NAN_X;
+          fv <= 8'h00;
         end
       end
 
@@ -637,9 +649,9 @@ module rd68041_fpu
                 fr[18] <= {5'h0, !op_unim || pk_src, 2'b00, 2'b00, op_unim, out_uns, 4'h0, 16'h0};
                 if (out_uns) begin
                   fr[15] <= {tag_of(outn), 5'h0, 24'h0};
-                  fr[22] <= {fpr[dstr][79:64], 16'h0};
-                  fr[23] <= fpr[dstr][63:32];
-                  fr[24] <= fpr[dstr][31:0];
+                  fr[22] <= {fpr_d[79:64], 16'h0};
+                  fr[23] <= fpr_d[63:32];
+                  fr[24] <= fpr_d[31:0];
                 end else if (pk_src) begin
                   // A packed source's 96 bits: 95-64 in FPTM 31-0, the rest in ETM.
                   fr[15] <= 32'h0;
@@ -653,9 +665,9 @@ module rd68041_fpu
                   fr[23] <= srcn.man[63:32];
                   fr[24] <= srcn.man[31:0];
                   fr[17] <= {tag_of(dstn), 5'h0, 24'h0};
-                  fr[19] <= {fpr[dstr][79:64], 16'h0};
-                  fr[20] <= fpr[dstr][63:32];
-                  fr[21] <= fpr[dstr][31:0];
+                  fr[19] <= {fpr_d[79:64], 16'h0};
+                  fr[20] <= fpr_d[63:32];
+                  fr[21] <= fpr_d[31:0];
                 end
               end else if (no_dp) begin
                 // FTST, FMOVE.X out: at once.
@@ -667,8 +679,8 @@ module rd68041_fpu
                   if (o_xv != 8'd0) begin
                     fr[16] <= {cmd1, 16'h0}; fr[10] <= x_pc; fr[2] <= 32'h0;
                     fr[15] <= {tag_of(outn), 5'h0, 24'h0};
-                    fr[22] <= {fpr[dstr][79:64], 16'h0};
-                    fr[23] <= fpr[dstr][63:32]; fr[24] <= fpr[dstr][31:0];
+                    fr[22] <= {fpr_d[79:64], 16'h0};
+                    fr[23] <= fpr_d[63:32]; fr[24] <= fpr_d[31:0];
                     fr[18] <= {5'h0, 1'b1, 2'b00, 2'b00, 1'b0, 1'b1, 4'h0, 16'h0};
                     fr[14] <= {8'h0, 4'h0, 1'b1, 3'b000, 16'h0};
                   end
@@ -706,8 +718,8 @@ module rd68041_fpu
             // (OPERR); NMCEXC the nonmaskable ones.
             fr[16] <= {cmd1, 16'h0}; fr[10] <= i_pc; fr[2] <= 32'h0;
             fr[15] <= {tag_of(outn), 5'h0, 24'h0};
-            fr[22] <= {fpr[dstr][79:64], 16'h0};
-            fr[23] <= fpr[dstr][63:32]; fr[24] <= fpr[dstr][31:0];
+            fr[22] <= {fpr_d[79:64], 16'h0};
+            fr[23] <= fpr_d[63:32]; fr[24] <= fpr_d[31:0];
             fr[19] <= {dp_r.sign, d_iexp[14:0], 16'h0};
             fr[20] <= d_iman[66:35]; fr[21] <= d_iman[34:3];
             fr[17] <= {3'b000, d_iexp[15], 4'h0, 24'h0};
@@ -755,8 +767,8 @@ module rd68041_fpu
             // E3, and T clear even when taken at once: Table 9-16 has "either",
             // UAE040 clears it, the FPSP ignores it with E3 (util.S, g_opcls).
             fr[18] <= {5'h0, 1'b0, 1'b1, 1'b0, 8'h0, 16'h0};
-            fr[19] <= {fpr[dstr][79:64], 16'h0};
-            fr[20] <= fpr[dstr][63:32]; fr[21] <= fpr[dstr][31:0];
+            fr[19] <= {fpr_d[79:64], 16'h0};
+            fr[20] <= fpr_d[63:32]; fr[21] <= fpr_d[31:0];
           end else begin
             // E1: FPTEMP the destination -- or, for FMOVE, FABS, FNEG, the
             // intermediate (overflow: rounded) -- and ETEMP the source.
@@ -767,8 +779,8 @@ module rd68041_fpu
               fr[21] <= d_ovfl ? dp_r.man[31:0]  : d_iman[34:3];
               fr[15] <= {rd68041_fpu_pkg::C_NORM, 5'h0, 24'h0};
             end else begin
-              fr[19] <= {fpr[dstr][79:64], 16'h0};
-              fr[20] <= fpr[dstr][63:32]; fr[21] <= fpr[dstr][31:0];
+              fr[19] <= {fpr_d[79:64], 16'h0};
+              fr[20] <= fpr_d[63:32]; fr[21] <= fpr_d[31:0];
             end
           end
         end
@@ -782,6 +794,12 @@ module rd68041_fpu
       if (flush && !(w_commit && rec_w)) begin rec_v <= 1'b0; rec_w <= 1'b0; end
       if (flush || x_adv) ph <= 2'd0;
     end
+  end
+
+  // FP7-FP0's RAM: a record's write as it commits (the valid bit beside it,
+  // above); not on RSTI, which leaves them NaNs.
+  always_ff @(posedge clk) begin
+    if (!crst && w_commit && rec_v && rec_w && rc_fpr_we) fpm[rc_fpr_n] <= rc_fpr_v;
   end
 
   logic unused_ok;

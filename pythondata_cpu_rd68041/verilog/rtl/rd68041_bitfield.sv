@@ -34,8 +34,11 @@ module rd68041_bitfield (
     input  wire   [2:0] boff,       // offset mod 8, for the memory case
     input  wire   [5:0] width,      // 1 to 32
 
-    // What to put back, right-justified in its low `width` bits.
+    // What to put back, right-justified in its low `width` bits; or, with
+    // flip, the field inverted (BFCHG), ins unused: the field's own bits
+    // not extracted and put back, a serial path through the whole unit.
     input  wire  [31:0] ins,
+    input  wire         flip,
 
     // The field, and what the instructions make of it.
     output wire  [31:0] field,      // right-justified, zero extended
@@ -106,14 +109,14 @@ module rd68041_bitfield (
   wire [31:0] insl = ins << (6'd32 - width);
 
   // The register case is the rotate undone.
-  wire [31:0] reg_new  = (reg_left & ~mask32) | (insl & mask32);
+  wire [31:0] reg_new  = flip ? (reg_left ^ mask32) : ((reg_left & ~mask32) | (insl & mask32));
   wire [63:0] redouble = {reg_new, reg_new};
   assign merged_reg = redouble[32'(roff) + 31 -: 32];
 
   // The memory case puts the window back where it came from.
   wire [39:0] mask40 = {mask32, 8'd0} >> boff;
   wire [39:0] insm   = {insl, 8'd0} >> boff;
-  assign merged_mem = (mem_data & ~mask40) | (insm & mask40);
+  assign merged_mem = flip ? (mem_data ^ mask40) : ((mem_data & ~mask40) | (insm & mask40));
 
 endmodule
 
